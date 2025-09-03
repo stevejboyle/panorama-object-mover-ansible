@@ -1,0 +1,13 @@
+panorama_ip: "192.168.1.10"
+api_key: "YOUR_API_KEY"
+
+# skip | overwrite
+collision_policy: "skip"
+
+# Path to the CSV file
+objects_csv: "files/objects.csv"
+
+# New options
+dry_run: false              # true = preview only
+check_dependencies: true    # only applies to address-group / service-group
+commit_changes: false       # true = commit Panorama at the end
