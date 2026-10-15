@@ -1,0 +1,149 @@
+---
+# Moves one CSV row (`obj`). Any failure is caught by `rescue` and logged,
+# so one bad row doesn't stop the rest.
+- name: "Move {{ obj.object_name }}"
+  block:
+    - name: Validate object type
+      ansible.builtin.assert:
+        that: obj.object_type in type_node_map
+        fail_msg: "Unsupported object type: {{ obj.object_type }}"
+        quiet: true
+
+    # XPath string literal: single quotes unless the value contains one.
+    - name: Build XPaths
+      ansible.builtin.set_fact:
+        node_name: "{{ type_node_map[obj.object_type] }}"
+        q_name: "{{ (\"'\" ~ obj.object_name ~ \"'\") if \"'\" not in obj.object_name else ('\"' ~ obj.object_name ~ '\"') }}"
+        q_src: "{{ (\"'\" ~ obj.src_scope ~ \"'\") if \"'\" not in obj.src_scope else ('\"' ~ obj.src_scope ~ '\"') }}"
+        q_dst: "{{ (\"'\" ~ obj.dst_scope ~ \"'\") if \"'\" not in obj.dst_scope else ('\"' ~ obj.dst_scope ~ '\"') }}"
+        dg_prefix: "/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name="
+
+    - name: Build container XPaths
+      ansible.builtin.set_fact:
+        src_container_xpath: "{{ ('/config/shared/' ~ node_name) if obj.src_scope | lower == 'shared' else (dg_prefix ~ q_src ~ ']/' ~ node_name) }}"
+        dst_container_xpath: "{{ ('/config/shared/' ~ node_name) if obj.dst_scope | lower == 'shared' else (dg_prefix ~ q_dst ~ ']/' ~ node_name) }}"
+
+    - name: Build entry XPaths
+      ansible.builtin.set_fact:
+        src_entry_xpath: "{{ src_container_xpath }}/entry[@name={{ q_name }}]"
+        dst_entry_xpath: "{{ dst_container_xpath }}/entry[@name={{ q_name }}]"
+
+    - name: Refuse a move onto itself
+      ansible.builtin.assert:
+        that: src_entry_xpath != dst_entry_xpath
+        fail_msg: "Source and destination scope are the same"
+        quiet: true
+
+    - name: Get destination entry (collision check)
+      ansible.builtin.uri:
+        url: "{{ api_base }}"
+        method: POST
+        headers: "{{ api_headers }}"
+        body_format: form-urlencoded
+        body: {type: config, action: get, xpath: "{{ dst_entry_xpath }}"}
+        validate_certs: "{{ panorama_validate_certs }}"
+        return_content: true
+      register: dst_get
+
+    - name: Get source entry
+      ansible.builtin.uri:
+        url: "{{ api_base }}"
+        method: POST
+        headers: "{{ api_headers }}"
+        body_format: form-urlencoded
+        body: {type: config, action: get, xpath: "{{ src_entry_xpath }}"}
+        validate_certs: "{{ panorama_validate_certs }}"
+        return_content: true
+      register: src_get
+
+    - name: Fail if source entry is missing
+      ansible.builtin.fail:
+        msg: "Object '{{ obj.object_name }}' not found in source scope '{{ obj.src_scope }}'"
+      when: src_get.content is not search(entry_regex)
+
+    - name: Work out what to do
+      ansible.builtin.set_fact:
+        dst_exists: "{{ dst_get.content is search(entry_regex) }}"
+        do_overwrite: "{{ collision_policy | lower == 'overwrite' }}"
+        entry_xml: "{{ src_get.content | regex_search('<entry\\b[\\s\\S]*</entry>') | trim }}"
+
+    - name: Check group members exist at destination or shared
+      when:
+        - check_dependencies | bool
+        - obj.object_type in ['address-group', 'service-group']
+      ansible.builtin.include_tasks: check_members.yml
+
+    - name: Skip on collision
+      when: dst_exists and not do_overwrite
+      block:
+        - name: Report skip
+          ansible.builtin.debug:
+            msg: "SKIP: destination already has '{{ obj.object_name }}' (collision_policy=skip)"
+        - name: Log skip
+          ansible.builtin.lineinfile:
+            path: "{{ log_file }}"
+            line: "{{ now().isoformat() }},{{ obj.object_name }},{{ obj.object_type }},{{ obj.src_scope }},{{ obj.dst_scope }},skipped,destination exists"
+
+    - name: Move
+      when: not dst_exists or do_overwrite
+      block:
+        - name: Dry-run preview
+          when: dry_run | bool
+          ansible.builtin.debug:
+            msg:
+              - "{{ 'would delete existing destination ' ~ dst_entry_xpath if dst_exists else 'destination is free' }}"
+              - "would set entry at {{ dst_container_xpath }}"
+              - "would delete source {{ src_entry_xpath }}"
+
+        - name: Delete existing destination entry (overwrite)
+          when: dst_exists and not dry_run | bool
+          ansible.builtin.uri:
+            url: "{{ api_base }}"
+            method: POST
+            headers: "{{ api_headers }}"
+            body_format: form-urlencoded
+            body: {type: config, action: delete, xpath: "{{ dst_entry_xpath }}"}
+            validate_certs: "{{ panorama_validate_certs }}"
+            return_content: true
+          register: r
+          failed_when: r.status != 200 or 'status="success"' not in r.content
+
+        - name: Set entry at destination
+          when: not dry_run | bool
+          ansible.builtin.uri:
+            url: "{{ api_base }}"
+            method: POST
+            headers: "{{ api_headers }}"
+            body_format: form-urlencoded
+            body: {type: config, action: set, xpath: "{{ dst_container_xpath }}", element: "{{ entry_xml }}"}
+            validate_certs: "{{ panorama_validate_certs }}"
+            return_content: true
+          register: r
+          failed_when: r.status != 200 or 'status="success"' not in r.content
+
+        - name: Delete source entry
+          when: not dry_run | bool
+          ansible.builtin.uri:
+            url: "{{ api_base }}"
+            method: POST
+            headers: "{{ api_headers }}"
+            body_format: form-urlencoded
+            body: {type: config, action: delete, xpath: "{{ src_entry_xpath }}"}
+            validate_certs: "{{ panorama_validate_certs }}"
+            return_content: true
+          register: r
+          failed_when: r.status != 200 or 'status="success"' not in r.content
+
+        - name: Log result
+          ansible.builtin.lineinfile:
+            path: "{{ log_file }}"
+            line: "{{ now().isoformat() }},{{ obj.object_name }},{{ obj.object_type }},{{ obj.src_scope }},{{ obj.dst_scope }},{{ 'planned' if dry_run | bool else 'moved' }},ok"
+
+  rescue:
+    - name: Report failure
+      ansible.builtin.debug:
+        msg: "Failed moving {{ obj.object_name }}: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
+    - name: Log failure
+      ansible.builtin.lineinfile:
+        path: "{{ log_file }}"
+        line: "{{ now().isoformat() }},{{ obj.object_name }},{{ obj.object_type }},{{ obj.src_scope }},{{ obj.dst_scope }},error,{{ (ansible_failed_result.msg | default(ansible_failed_result) | string) | replace(',', ';') | replace('\n', ' ') }}"

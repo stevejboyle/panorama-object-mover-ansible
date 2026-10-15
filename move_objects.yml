@@ -1,259 +1,81 @@
 ---
+# Move PAN-OS objects between Panorama scopes (device group <-> device group,
+# shared <-> device group). Reads files/objects.csv, copies each <entry> to the
+# destination scope, then deletes it from the source. Panorama is only
+# committed when commit_changes=true.
 - name: Move PAN-OS objects between Panorama scopes
   hosts: localhost
-  gather_facts: no
+  connection: local
+  gather_facts: false
+
   vars:
     api_base: "https://{{ panorama_ip }}/api/"
-    # Map object_type to node name
+    # The API key travels in a header, never in the URL (URLs end up in logs).
+    api_headers:
+      X-PAN-KEY: "{{ api_key }}"
     type_node_map:
-      address: "address"
-      address-group: "address-group"
-      service: "service"
-      service-group: "service-group"
-
-  collections:
-    - paloaltonetworks.panos
-    - community.general
+      address: address
+      address-group: address-group
+      service: service
+      service-group: service-group
+    entry_regex: '<entry\b'
 
   tasks:
     - name: Read objects from CSV
-      set_fact:
-        objects_to_move: "{{ lookup('community.general.read_csv', objects_csv) }}"
-      vars:
-        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+      community.general.read_csv:
+        path: "{{ objects_csv }}"
+      register: objects_csv_data
 
-- name: Initialize logging (create logs dir)
-  file:
-    path: "logs"
-    state: directory
+    - name: Keep non-empty rows
+      ansible.builtin.set_fact:
+        objects_to_move: "{{ objects_csv_data.list | selectattr('object_name') | list }}"
 
-- name: Set log file path
-  set_fact:
-    log_timestamp: "{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}"
-    log_file: "logs/moves_{{ log_timestamp }}.csv"
-
-- name: Create log CSV with header
-  copy:
-    dest: "{{ log_file }}"
-    content: "timestamp,object_name,object_type,src_scope,dst_scope,status,message\n"
-    force: no
-
-    - name: Ensure we have tasks
-      assert:
-        that:
-          - objects_to_move | length > 0
+    - name: Ensure the CSV has rows
+      ansible.builtin.assert:
+        that: objects_to_move | length > 0
         fail_msg: "No rows found in {{ objects_csv }}"
-        success_msg: "Loaded {{ objects_to_move | length }} rows from CSV"
+        success_msg: "Loaded {{ objects_to_move | length }} rows from {{ objects_csv }}"
 
-    - name: Iterate over objects
+    - name: Create logs directory
+      ansible.builtin.file:
+        path: logs
+        state: directory
+        mode: "0755"
+
+    - name: Set log file path
+      ansible.builtin.set_fact:
+        log_file: "logs/moves_{{ now().strftime('%Y%m%d_%H%M%S') }}.csv"
+
+    - name: Create log CSV with header
+      ansible.builtin.copy:
+        dest: "{{ log_file }}"
+        content: "timestamp,object_name,object_type,src_scope,dst_scope,status,message\n"
+        force: false
+        mode: "0644"
+
+    - name: Move each object
+      ansible.builtin.include_tasks: tasks/move_one.yml
       loop: "{{ objects_to_move }}"
       loop_control:
-        loop_var: item
-        label: "{{ item.object_name }} ({{ item.object_type }}) {{ item.src_scope }} -> {{ item.dst_scope }}"
-      block:
-        - name: Validate type
-          assert:
-            that:
-              - item.object_type in type_node_map
-            fail_msg: "Unsupported object type: {{ item.object_type }}"
+        loop_var: obj
+        label: "{{ obj.object_name }} ({{ obj.object_type }}) {{ obj.src_scope }} -> {{ obj.dst_scope }}"
 
-        - name: Build XPaths for src/dst
-          set_fact:
-            node_name: "{{ type_node_map[item.object_type] }}"
-            src_entry_xpath: >-
-              {{ '/config/shared/%s/entry[@name=%s]' % (node_name, quote(item.object_name)) if item.src_scope | lower == 'shared'
-                 else '/config/devices/entry[@name=%s]/device-group/entry[@name=%s]/%s/entry[@name=%s]' % ( quote('localhost.localdomain'), quote(item.src_scope), node_name, quote(item.object_name) ) }}
-            dst_container_xpath: >-
-              {{ '/config/shared/%s' % node_name if item.dst_scope | lower == 'shared'
-                 else '/config/devices/entry[@name=%s]/device-group/entry[@name=%s]/%s' % ( quote('localhost.localdomain'), quote(item.dst_scope), node_name ) }}
-            dst_entry_xpath: >-
-              {{ '/config/shared/%s/entry[@name=%s]' % (node_name, quote(item.object_name)) if item.dst_scope | lower == 'shared'
-                 else '/config/devices/entry[@name=%s]/device-group/entry[@name=%s]/%s/entry[@name=%s]' % ( quote('localhost.localdomain'), quote(item.dst_scope), node_name, quote(item.object_name) ) }}
+    - name: Commit on Panorama
+      when: commit_changes | bool and not dry_run | bool
+      ansible.builtin.uri:
+        url: "{{ api_base }}"
+        method: POST
+        headers: "{{ api_headers }}"
+        body_format: form-urlencoded
+        body:
+          type: commit
+          cmd: "<commit></commit>"
+        validate_certs: "{{ panorama_validate_certs }}"
+        return_content: true
+      register: commit_result
+      failed_when: commit_result.status != 200 or 'status="success"' not in commit_result.content
 
-        - name: Check if destination already has the object
-          uri:
-            url: "{{ api_base }}"
-            method: GET
-            validate_certs: no
-            return_content: yes
-            status_code: 200
-            params:
-              type: "config"
-              action: "get"
-              key: "{{ api_key }}"
-              xpath: "{{ dst_entry_xpath }}"
-          register: dst_get
-
-        - name: Decide collision handling
-          set_fact:
-            dst_exists: "{{ (dst_get.content is search('<entry[\\s\\S]*?>')) }}"
-            do_overwrite: "{{ collision_policy | lower == 'overwrite' }}"
-
-        - name: Delete destination entry if overwrite requested and it exists
-          when: dst_exists and do_overwrite and not dry_run
-          paloaltonetworks.panos.panos_xpath:
-            provider:
-              ip_address: "{{ panorama_ip }}"
-              api_key: "{{ api_key }}"
-            xpath: "{{ dst_entry_xpath }}"
-            commit: false
-            operation: "delete"
-
-        - name: DRY-RUN would delete destination entry (overwrite)
-          when: dst_exists and do_overwrite and dry_run
-          debug:
-            msg: "DRY-RUN: would delete destination {{ dst_entry_xpath }}"
-
-        - name: Fetch source entry XML
-          uri:
-            url: "{{ api_base }}"
-            method: GET
-            validate_certs: no
-            return_content: yes
-            status_code: 200
-            params:
-              type: "config"
-              action: "get"
-              key: "{{ api_key }}"
-              xpath: "{{ src_entry_xpath }}"
-          register: src_get
-
-        - name: Fail if source entry is missing
-          when: not (src_get.content is search('<entry[\\s\\S]*?>'))
-          fail:
-            msg: "Object '{{ item.object_name }}' not found in src scope '{{ item.src_scope }}'."
-
-        - name: Extract <entry ...> XML from source
-          set_fact:
-            entry_xml: "{{ (src_get.content | regex_search('(?s)<entry\\b[\\s\\S]*?</entry>')) | trim }}"
-
-        - name: Dependency discovery (groups only) — collect static members
-          when: check_dependencies and item.object_type in ['address-group','service-group']
-          vars:
-            # grab the static/members block
-            static_block: "{{ entry_xml | regex_search('(?s)<static>[\\s\\S]*?</static>') | default('') }}"
-            svc_block: "{{ entry_xml | regex_search('(?s)<members>[\\s\\S]*?</members>') | default('') }}"
-          set_fact:
-            member_names: >-
-              {%- if item.object_type == 'address-group' -%}
-                {{ static_block | regex_findall('<member>([^<]+)</member>') }}
-              {%- elif item.object_type == 'service-group' -%}
-                {{ svc_block | regex_findall('<member>([^<]+)</member>') }}
-              {%- else -%}
-                []
-              {%- endif -%}
-
-        - name: Initialize missing list
-          when: check_dependencies and item.object_type in ['address-group','service-group']
-          set_fact:
-            missing_members: []
-
-        - name: Check presence of each member in dst scope or shared
-          when: check_dependencies and item.object_type in ['address-group','service-group'] and (member_names | length) > 0
-          vars:
-            ref_type: "{{ 'address' if item.object_type == 'address-group' else 'service' }}"
-            node_ref: "{{ type_node_map[ref_type] }}"
-            dst_member_xpath: >-
-              {{ '/config/shared/%s/entry[@name=%s]' % (node_ref, quote(member)) if item.dst_scope | lower == 'shared'
-                 else '/config/devices/entry[@name=%s]/device-group/entry[@name=%s]/%s/entry[@name=%s]' % ( quote('localhost.localdomain'), quote(item.dst_scope), node_ref, quote(member) ) }}
-            shared_member_xpath: "/config/shared/{{ node_ref }}/entry[@name={{ quote(member) }}]"
-          loop: "{{ member_names }}"
-          loop_control:
-            loop_var: member
-          block:
-            - name: GET member at dst_scope
-              uri:
-                url: "{{ api_base }}"
-                method: GET
-                validate_certs: no
-                return_content: yes
-                status_code: 200
-                params:
-                  type: "config"
-                  action: "get"
-                  key: "{{ api_key }}"
-                  xpath: "{{ dst_member_xpath }}"
-              register: member_dst_get
-
-            - name: GET member at shared (fallback)
-              uri:
-                url: "{{ api_base }}"
-                method: GET
-                validate_certs: no
-                return_content: yes
-                status_code: 200
-                params:
-                  type: "config"
-                  action: "get"
-                  key: "{{ api_key }}"
-                  xpath: "{{ shared_member_xpath }}"
-              register: member_shared_get
-
-            - name: Append to missing if not present
-              when: not (member_dst_get.content is search('<entry[\\s\\S]*?>')) and not (member_shared_get.content is search('<entry[\\s\\S]*?>'))
-              set_fact:
-                missing_members: "{{ missing_members + [member] }}"
-
-        - name: Warn or fail on missing dependencies
-          when: check_dependencies and item.object_type in ['address-group','service-group'] and (missing_members | length) > 0
-          block:
-            - name: Dependency warning
-              when: deps_policy | lower == 'warn'
-              debug:
-                msg: "WARNING: Group '{{ item.object_name }}' has missing members at destination/shared: {{ missing_members }}"
-            - name: Dependency failure
-              when: deps_policy | lower == 'fail'
-              fail:
-                msg: "FAIL: Group '{{ item.object_name }}' missing members at destination/shared: {{ missing_members }}"
-
-        - name: Skip if collision and policy is 'skip'
-          when: dst_exists and not do_overwrite
-          debug:
-            msg: "SKIP: Destination already has '{{ item.object_name }}' and collision_policy=skip"
-
-        - name: Set destination entry (create/copy)
-          when: ((not dst_exists) or do_overwrite) and not dry_run
-          paloaltonetworks.panos.panos_xpath:
-            provider:
-              ip_address: "{{ panorama_ip }}"
-              api_key: "{{ api_key }}"
-            xpath: "{{ dst_container_xpath }}"
-            element: "{{ entry_xml }}"
-            commit: false
-            operation: "set"
-
-        - name: DRY-RUN would set destination entry
-          when: ((not dst_exists) or do_overwrite) and dry_run
-          debug:
-            msg: "DRY-RUN: would set entry at {{ dst_container_xpath }} for '{{ item.object_name }}'"
-
-        - name: Delete source entry
-          when: ((not dst_exists) or do_overwrite) and not dry_run
-          paloaltonetworks.panos.panos_xpath:
-            provider:
-              ip_address: "{{ panorama_ip }}"
-              api_key: "{{ api_key }}"
-            xpath: "{{ src_entry_xpath }}"
-            commit: false
-            operation: "delete"
-
-        - name: DRY-RUN would delete source entry
-          when: ((not dst_exists) or do_overwrite) and dry_run
-          debug:
-            msg: "DRY-RUN: would delete source entry {{ src_entry_xpath }}"
-
-      rescue:
-        - debug:
-            msg: "Failed moving {{ item.object_name }}: {{ ansible_failed_result.msg | default(ansible_failed_result) }}"
-        - name: LOG — error
-          lineinfile:
-            path: "{{ log_file }}"
-            insertafter: EOF
-            line: "{{ lookup('pipe','date -Iseconds') }},{{ item.object_name }},{{ item.object_type }},{{ item.src_scope }},{{ item.dst_scope }},error,{{ (ansible_failed_result.msg | default(ansible_failed_result) | string) | replace(',', ';') | replace('\n',' ') }}"
-
-    - name: Commit on Panorama (optional)
-      when: commit_changes and not dry_run
-      paloaltonetworks.panos.panos_commit:
-        provider:
-          ip_address: "{{ panorama_ip }}"
-          api_key: "{{ api_key }}"
+    - name: Show commit job
+      when: commit_result is defined and commit_result.content is defined
+      ansible.builtin.debug:
+        msg: "{{ commit_result.content | regex_search('<job>[0-9]+</job>') | default('commit queued') }}"

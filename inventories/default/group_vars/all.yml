@@ -1,5 +1,10 @@
 panorama_ip: "192.168.1.10"
+# Prefer an encrypted value: ansible-vault encrypt_string 'KEY' --name api_key
 api_key: "YOUR_API_KEY"
+
+# Verify Panorama's TLS certificate. Set false only for a lab Panorama with a
+# self-signed certificate.
+panorama_validate_certs: true
 
 # skip | overwrite
 collision_policy: "skip"
@@ -7,7 +12,7 @@ collision_policy: "skip"
 # Path to the CSV file
 objects_csv: "files/objects.csv"
 
-# New options
 dry_run: false              # true = preview only
 check_dependencies: true    # only applies to address-group / service-group
+deps_policy: "warn"         # warn | fail when a group member is missing at destination
 commit_changes: false       # true = commit Panorama at the end

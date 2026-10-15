@@ -23,6 +23,9 @@ This mirrors the Python version's behavior: create in destination, then delete f
 ```
 panorama-object-mover-ansible/
 ├─ move_objects.yml
+├─ tasks/
+│  ├─ move_one.yml        # one CSV row: collision check, copy, delete
+│  └─ check_members.yml   # group member dependency check
 ├─ files/
 │  └─ objects.csv
 ├─ inventories/
@@ -36,7 +39,7 @@ panorama-object-mover-ansible/
 
 ## Requirements
 - Ansible 2.13+
-- Collections:
+- Collection `community.general` (for `read_csv`; already included in the full `ansible` package):
   ```bash
   ansible-galaxy collection install -r collections/requirements.yml
   ```
@@ -45,7 +48,12 @@ panorama-object-mover-ansible/
 Edit `inventories/default/group_vars/all.yml`:
 ```yaml
 panorama_ip: "192.168.1.10"
+# Prefer an encrypted value: ansible-vault encrypt_string 'KEY' --name api_key
 api_key: "YOUR_API_KEY"
+
+# Verify Panorama's TLS certificate. Set false only for a lab Panorama with a
+# self-signed certificate.
+panorama_validate_certs: true
 
 # skip | overwrite
 collision_policy: "skip"
@@ -53,11 +61,13 @@ collision_policy: "skip"
 # Path to the CSV file
 objects_csv: "files/objects.csv"
 
-# New options
 dry_run: false              # true = preview only
 check_dependencies: true    # only applies to address-group / service-group
+deps_policy: "warn"         # warn | fail when a group member is missing at destination
 commit_changes: false       # true = commit Panorama at the end
 ```
+
+The API key is sent in the `X-PAN-KEY` header, never in the URL.
 
 ## Input CSV
 `files/objects.csv` must have this header:
@@ -87,7 +97,8 @@ ansible-playbook -i inventories/default/inventory.yml move_objects.yml -e check_
 ```
 
 ## Notes
-- Uses `paloaltonetworks.panos.panos_xpath` to `set`/`delete`, and `uri` to `get` the source `<entry>` XML.
+- Talks to the PAN-OS XML API directly with `ansible.builtin.uri` (`get`, `set`, `delete`, `commit`); no PAN-OS collection is needed.
+- Each row is handled independently: a failure is logged as `error` and the run continues with the next row.
 - For **shared** scope, container path is `/config/shared/<type>`.
 - For device groups, container path is `/config/devices/entry[@name='localhost.localdomain']/device-group/entry[@name='<DG>']/<type>`.
 - Moving groups (address-group / service-group) may require moving their members first; enable `check_dependencies` to enforce.

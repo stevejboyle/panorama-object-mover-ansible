@@ -1,0 +1,42 @@
+---
+# For a group, verify every static member exists in the destination scope or
+# in shared. Sets missing_members; warns or fails per deps_policy.
+- name: Collect static member names
+  ansible.builtin.set_fact:
+    member_names: "{{ (entry_xml | regex_search('<(static|members)>[\\s\\S]*?</(static|members)>') | default('', true)) | regex_findall('<member>([^<]+)</member>') }}"
+    member_node: "{{ 'address' if obj.object_type == 'address-group' else 'service' }}"
+    missing_members: []
+
+- name: Look up each member
+  ansible.builtin.uri:
+    url: "{{ api_base }}"
+    method: POST
+    headers: "{{ api_headers }}"
+    body_format: form-urlencoded
+    # Destination scope first; '|' unions in the shared copy.
+    body:
+      type: config
+      action: get
+      xpath: >-
+        {{ dst_container_xpath | regex_replace('/' ~ node_name ~ '$', '/' ~ member_node) }}/entry[@name='{{ member }}']
+        | /config/shared/{{ member_node }}/entry[@name='{{ member }}']
+    validate_certs: "{{ panorama_validate_certs }}"
+    return_content: true
+  loop: "{{ member_names }}"
+  loop_control:
+    loop_var: member
+  register: member_lookups
+
+- name: Record missing members
+  ansible.builtin.set_fact:
+    missing_members: "{{ member_lookups.results | rejectattr('content', 'search', entry_regex) | map(attribute='member') | list }}"
+
+- name: Missing members (warn)
+  when: missing_members | length > 0 and deps_policy | lower == 'warn'
+  ansible.builtin.debug:
+    msg: "WARNING: group '{{ obj.object_name }}' has members missing at destination/shared: {{ missing_members }}"
+
+- name: Missing members (fail)
+  when: missing_members | length > 0 and deps_policy | lower == 'fail'
+  ansible.builtin.fail:
+    msg: "Group '{{ obj.object_name }}' has members missing at destination/shared: {{ missing_members }}"
