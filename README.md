@@ -69,6 +69,8 @@ commit_changes: false       # true = commit Panorama at the end
 
 The API key is sent in the `X-PAN-KEY` header, never in the URL.
 
+`all.yml` is tracked in Git and ships with the placeholder `YOUR_API_KEY`. Never commit a live key: encrypt it with `ansible-vault encrypt_string` as shown, or pass it at run time (for example `-e api_key=...` from a secrets manager) and leave the placeholder in the file.
+
 ## Input CSV
 `files/objects.csv` must have this header:
 ```
@@ -117,3 +119,6 @@ Possible `status` values:
 ```bash
 tail -f logs/moves_*.csv
 ```
+
+## Disclaimer
+An independent, personally maintained project by Steve Boyle. It is not official Palo Alto Networks software and is not affiliated with, endorsed by, or supported by Palo Alto Networks. Palo Alto Networks, PAN-OS and Panorama are trademarks of Palo Alto Networks, Inc., used here only to describe what the playbook works with. Test against a lab Panorama first.
